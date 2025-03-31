@@ -40,14 +40,15 @@ def llama3_2_100M() -> torchtune.modules.transformer.TransformerDecoder:
         scale_factor=32,
     )
 
+# TODO: Change so dims are same but layers are smaller or some shit
 def llama3_2_downsized() -> torchtune.modules.transformer.TransformerDecoder:
     """Create a downsized Llama 3.2 model configuration."""
     return llama3_2.llama3_2(
         vocab_size=128_256,
-        num_layers=4,
-        num_heads=8,
+        num_layers=2, # 1/2
+        num_heads=4, # 1/2
         num_kv_heads=2,
-        embed_dim=512, # 1/2 of 1024
+        embed_dim=1024, # keep same as llama3_2_100M
         max_seq_len=2048,
         intermediate_dim=4096, # 1/2 of 8192
         attn_dropout=0.0,
@@ -173,7 +174,7 @@ class Model(
         # Initialize backbone and decoder transformers
         self.backbone, backbone_dim = _prepare_transformer(FLAVORS[config.backbone_flavor]())
         self.decoder, decoder_dim = _prepare_transformer(FLAVORS[config.decoder_flavor]())
-        self.draft_decoder, draft_decoder_dim = _prepare_transformer(FLAVORS["llama-downsized"]())
+        self.draft_decoder, draft_decoder_dim = _prepare_transformer(FLAVORS["llama-downsized"]()) # also untrained rn bruh
 
         print(f"Backbone dimension: {backbone_dim}")
         print(f"Decoder dimension: {decoder_dim}")
@@ -217,10 +218,110 @@ class Model(
             # Setup caches for both backbone and decoder transformers
             self.backbone.setup_caches(max_batch_size, dtype)
             self.decoder.setup_caches(max_batch_size, dtype, decoder_max_seq_len=self.config.audio_num_codebooks)
-
+            self.draft_decoder.setup_caches(max_batch_size, dtype, decoder_max_seq_len=self.config.audio_num_codebooks)
+            
         # Create and register causal masks as buffers
         self.register_buffer("backbone_causal_mask", _create_causal_mask(self.backbone.max_seq_len, device))  # (max_seq_len, max_seq_len)
         self.register_buffer("decoder_causal_mask", _create_causal_mask(self.config.audio_num_codebooks, device))  # (audio_num_codebooks, audio_num_codebooks)
+
+    def generate_frame_speculative(
+        self, 
+        tokens: torch.Tensor,
+        tokens_mask: torch.Tensor,
+        input_pos: torch.Tensor,
+        temperature: float,
+        topk: int) -> torch.Tensor:
+        """
+        Performs speculative decoding on the decoder using the draft model.
+        """
+        # (Step 0) generate c0 with codebook0_head as before
+
+        dtype = next(self.parameters()).dtype
+        b, s, _ = tokens.size() 
+        assert self.backbone.caches_are_enabled(), "backbone caches are not enabled"
+        
+        curr_backbone_mask = _index_causal_mask(self.backbone_causal_mask, input_pos)
+        
+        embeds = self._embed_tokens(tokens)
+        masked_embeds = embeds * tokens_mask.unsqueeze(-1)
+        h = masked_embeds.sum(dim=2) 
+        
+        h = self.backbone(h, input_pos=input_pos, mask=curr_backbone_mask).to(dtype=dtype)
+        last_h = h[:, -1, :]
+        
+        c0_logits = self.codebook0_head(last_h)
+        c0_sample = sample_topk(c0_logits, topk, temperature)
+        c0_embed = self._embed_audio(0, c0_sample)
+
+        # Initialize current hidden state and sampled tokens
+        # Shape of curr_h: (batch_size, 2, backbone_dim) - concatenating last_h and c0_embed
+        # Shape of curr_sample: (batch_size, 1)
+        curr_h = torch.cat([last_h.unsqueeze(1), c0_embed], dim=1) # combine the last hidden state from the backbone and the first codebook embedding
+        curr_sample = c0_sample.clone()
+        
+        # Create position indices for decoder
+        # Shape: (batch_size, 2) 
+        # literally always exactly [0, 1] bc only 2 elements in sequence
+        curr_pos = torch.arange(0, curr_h.size(1), device=curr_h.device).unsqueeze(0).repeat(curr_h.size(0), 1)
+
+        # Reset KV caches
+        self.decoder.reset_caches()
+        self.draft_decoder.reset_caches()
+
+        # Speculative decoding loop
+        while curr_sample.shape[1] < self.config.audio_num_codebooks:
+
+            # Guessing 3 codebooks ahead at a time.
+            speculative_len = min(3, self.config.audio_num_codebooks - curr_sample.shape[1])  # Tune this
+            speculative_samples = []
+
+            # Step 1: Generate speculative samples using the draft decoder
+            for _ in range(speculative_len):
+                # Create causal mask for current positions
+                mask = _index_causal_mask(self.decoder_causal_mask, curr_pos)
+                
+                # Run the draft decoder on current hidden states
+                draft_h: torch.Tensor = self.draft_decoder(self.projection(curr_h), input_pos=curr_pos, mask=mask)
+                
+                # Get the index of the next codebook to predict
+                i = curr_sample.shape[1]
+                
+                # Take the decoder output for the last position (draft_h[:, -1, :])
+                # Multiply it by the specific weight matrix for this codebook (self.audio_head[i - 1])
+                # This gives us logits over the vocabulary for this codebook
+                # sample a token using topk sampling with temperature
+             
+                # Convert draft_h to same dtype as audio_head before matmul
+                logits = torch.matmul(draft_h[:, -1, :].to(self.audio_head.dtype), self.audio_head[i - 1])
+                sample = sample_topk(logits, topk, temperature) # (B, 1)
+
+                speculative_samples.append(sample)
+
+                # Embed the sampled token
+                embed = self._embed_audio(i, sample) # (B, 1, D)
+                
+                # Update current hidden state with the new embedding
+                curr_h = embed
+                
+                # Increment position indices for next token
+                curr_pos = curr_pos[:, -1:] + 1
+                
+                # Append the sampled token to our running sequence
+                curr_sample = torch.cat([curr_sample, sample], dim=1)
+
+            # Step 2: Verify speculative samples with the full decoder
+            print(f"Speculative samples: {speculative_samples}")
+            
+
+            
+            # Process all tokens at once
+            # full_h = self.decoder(self.projection(curr_h), input_pos=curr_pos, mask=mask)
+
+
+
+        # Return the complete sequence of audio tokens
+        return curr_sample
+
 
     def generate_frame(
         self,
